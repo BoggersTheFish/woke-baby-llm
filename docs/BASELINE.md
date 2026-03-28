@@ -69,7 +69,8 @@ python sandbox.py \
 | Field | Value |
 |-------|--------|
 | Date (UTC) | 2026-03-28T15:49:20+00:00 |
-| Git commit | `6858eca` (parent of doc update; re-run `git rev-parse --short HEAD` after your commit) |
+| Git commit (training run) | `6858eca` |
+| Git commit (docs + trajectory `sandbox.py` on `main`) | `1685e55` |
 | Corpus | `data/corpus.txt` — 51 lines loaded, 49 usable (≥7 in-vocab tokens), 2 train / val lines for val split |
 | Last epoch | 25/25 |
 | Windows per epoch | 180 |
