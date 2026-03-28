@@ -20,12 +20,15 @@ Phase 0 locks a **reproducible reference** before scaling data, windows, or mode
      --lr 0.001 \
      --lr-decay-every 15 \
      --lr-gamma 0.7 \
+     --epochs 25 \
      --baseline-out docs/BASELINE_LAST_RUN.txt
    ```
 
 2. The script prints a **Phase 0 baseline** block at the end (metrics + three fixed generations). `--baseline-out` saves that block to a file for git or notes.
 
 3. Copy the printed block into the **“Recorded baseline”** section below when you want a frozen snapshot in git.
+
+For growing the training set before serious baselines, see **[CORPUS_SCALING.md](CORPUS_SCALING.md)**.
 
 **Fixed generation prompts** (defined in `sandbox.py` as `BASELINE_PROMPT_1` … `BASELINE_PROMPT_3`) are always the same so outputs are comparable across runs.
 

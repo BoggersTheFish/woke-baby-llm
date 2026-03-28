@@ -21,9 +21,9 @@ There is **no** attention, no transformer blocks, and no external model—only *
 
 This repo is a **research sandbox**, not a production language model.
 
-- **Data vs vocabulary**: The model is trained on **dozens of short sentences** against a **512-word** vocabulary. That is far too little signal for fluent text; the network tends toward **phrase-level templates** even with tension-aware dynamics and decoding.
+- **Data vs vocabulary**: The model is trained on **dozens of short sentences** against a **512-word** vocabulary. That is far too little signal for fluent text; the network tends toward **phrase-level templates** even with tension-aware dynamics and decoding. See **[docs/CORPUS_SCALING.md](docs/CORPUS_SCALING.md)** for scaling with **simple stories**, vocab rules, `--print-vocab`, and the optional **[scripts/text_to_corpus_lines.py](scripts/text_to_corpus_lines.py)** preprocessor.
 - **Coherence**: Do not expect topic continuity, factual answers, or long-range syntax. Improvements need **more and more varied training text**, **longer windows**, **more epochs or capacity**, and/or **different objectives**—not only dynamics tweaks.
-- **Throughput**: The bundled script runs **on CPU** by default; **pre-training is slow** at full epoch counts. Reduce `NUM_EPOCHS` or corpus size while iterating.
+- **Throughput**: The bundled script runs **on CPU** by default; **pre-training is slow** at full epoch counts. Reduce **`--epochs`** or corpus size while iterating.
 
 Contributions are welcome if you want to extend the experiment (data pipeline, evaluation, or architecture).
 
@@ -52,9 +52,9 @@ Default training text is **`data/corpus.txt`** (next to `sandbox.py`). Use your 
 python sandbox.py --corpus path/to/sentences.txt
 ```
 
-Useful flags: `--val-fraction 0.05` (validation cross-entropy after each epoch; `0` disables), `--seed 42`, `--epoch-copies 2` (repeat the sentence list per epoch before shuffling), `--baseline-out path` (Phase 0 snapshot; see `docs/BASELINE.md`). **Training objective:** `--loss-mode trajectory` (default) uses **contrastive** alignment between the **evolved** context-window state and the **evolved** shifted teacher window `[x₂…x_W, next_token]`, plus optional `--token-aux-ce` on the readout. Window evolution is **tension-adaptive** (early exit when stable, noise when unstable), not a fixed step count. Use `--trajectory-batch-size` (≥2) for in-batch negatives. Use `--loss-mode ce` for classic next-token CE only. Run `python sandbox.py --help` for details.
+Useful flags: `--epochs N` (training passes; default matches `NUM_EPOCHS` in code), `--state-dim` (embedding width, default 512), `--print-vocab` (print `FULL_VOCAB` one word per line and exit), `--val-fraction 0.05` (validation cross-entropy after each epoch; `0` disables), `--seed 42`, `--epoch-copies 2` (repeat the sentence list per epoch before shuffling), `--baseline-out path` (Phase 0 snapshot; see `docs/BASELINE.md`). **Training objective:** `--loss-mode trajectory` (default) uses **contrastive** alignment between the **evolved** context-window state and the **evolved** shifted teacher window `[x₂…x_W, next_token]`, plus optional `--token-aux-ce` on the readout. Window evolution is **tension-adaptive** (early exit when stable, noise when unstable), not a fixed step count. Use `--trajectory-batch-size` (≥2) for in-batch negatives. Use `--loss-mode ce` for classic next-token CE only. Run `python sandbox.py --help` for details.
 
-**Data scale:** the default corpus is only **dozens of lines**—enough to smoke-test the code, not to train a useful model. For real runs, add **thousands to tens of thousands** of lines (one sentence per line; UTF-8) with words from the vocab. With a tiny hold-out, **val CE is noisy**; the script warns when the validation window count is very small—trust **train CE** and qualitative generations until you have enough lines and a larger val split.
+**Data scale:** the default corpus is only **dozens of lines**—enough to smoke-test the code, not to train a useful model. For real runs, add **thousands to tens of thousands** of lines (one sentence per line; UTF-8) with words from the vocab. Details, story-corpus workflow, and **`python sandbox.py --print-vocab`**: **[docs/CORPUS_SCALING.md](docs/CORPUS_SCALING.md)**. With a tiny hold-out, **val CE is noisy**; the script warns when the validation window count is very small—trust **train CE** and qualitative generations until you have enough lines and a larger val split.
 
 **Diagnostics:** `--epoch-metrics-csv run.csv` appends per-epoch columns (mean loss, CE, traj contrast, **mean final-step tension**, max batch loss, LR) for plotting. `--log-hard-batch-loss-above 0.2` prints the first context in a batch when loss spikes. `--lr-decay-every 10 --lr-gamma 0.5` applies `StepLR` after each epoch block.
 
@@ -107,10 +107,10 @@ The script is tuned for **CPU** research runs, not large-batch GPU training.
 
 | Idea | Where |
 |------|--------|
-| Window length / epochs / entropy bonus | `WINDOW_SIZE`, `NUM_EPOCHS`, `ENTROPY_WEIGHT`, `ENTROPY_FLOOR`, `DRIFT_MIN` |
+| Window length / epochs / entropy bonus | `WINDOW_SIZE`, `NUM_EPOCHS` (CLI: `--epochs`), `ENTROPY_WEIGHT`, `ENTROPY_FLOOR`, `DRIFT_MIN` |
 | Window differentiation (anti-collapse) | `WINDOW_NONLINEAR_GAIN` (tanh strength in window path), `POSITION_ASYM_STRENGTH`, `WINDOW_INTERACTION_SCALE_INIT`, `WINDOW_POSITION_GAMMA_INIT` |
 | Tension-adaptive window | `MAX_WINDOW_STEPS`; `WINDOW_TENSION_USE_ENTROPY` (if False, tension is geometry-only: energy + λ·mismatch — no readout entropy); separate tol/high for geometry vs entropy (`WINDOW_TENSION_TOL_GEOMETRY`, `WINDOW_TENSION_TOL_ENTROPY`, …); coupling step `WINDOW_INTERACTION_DT_INIT`, `WINDOW_NONLINEAR_GAIN` |
-| Data CLI | `--corpus`, `--val-fraction`, `--seed`, `--epoch-copies`, `--baseline-out`, `--window-size`, `--num-dynamics-steps`, `--trajectory-batch-size`, `--quick-test`, `--loss-mode`, `--token-aux-ce`, `--lr`, `--lr-decay-every`, `--lr-gamma`, `--epoch-metrics-csv`, `--log-hard-batch-loss-above` |
+| Data CLI | `--corpus`, `--epochs`, `--state-dim`, `--print-vocab`, `--val-fraction`, `--seed`, `--epoch-copies`, `--baseline-out`, `--window-size`, `--num-dynamics-steps`, `--trajectory-batch-size`, `--quick-test`, `--loss-mode`, `--token-aux-ce`, `--lr`, `--lr-decay-every`, `--lr-gamma`, `--epoch-metrics-csv`, `--log-hard-batch-loss-above` |
 | Training regularization | `LABEL_SMOOTHING`, `BIGRAM_TRAIN_WEIGHT`, `TRAIN_LOGIT_NOISE` |
 | Generation sampling | `GEN_TOP_K`, `GEN_REPEAT_LOGIT_PENALTY`, `GEN_NO_REPEAT_LAST_EXTRA`, `GEN_TENSION_TEMP_SCALE`, `generation_temperature` (constructor arg) |
 | Slow memory | `slow_decay`; learnable `slow_lr` |

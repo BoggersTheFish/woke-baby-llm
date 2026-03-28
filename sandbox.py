@@ -1314,6 +1314,7 @@ def _format_phase0_baseline_block(
     epoch_copies: int,
     window_size: int,
     num_dynamics_steps: int,
+    num_epochs: int,
     loss_mode: str,
     token_aux_ce: float,
     last_epoch: int,
@@ -1347,8 +1348,8 @@ def _format_phase0_baseline_block(
         f"corpus: {corpus_path}\n"
         f"seed: {seed}  val_fraction: {val_fraction}  epoch_copies: {epoch_copies}\n"
         f"loss_mode: {loss_mode}  token_aux_ce: {token_aux_ce}\n"
-        f"window_size: {window_size}  num_dynamics_steps: {num_dynamics_steps}  num_epochs: {NUM_EPOCHS}\n"
-        f"last_epoch: {last_epoch}/{NUM_EPOCHS}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
+        f"window_size: {window_size}  num_dynamics_steps: {num_dynamics_steps}  num_epochs: {num_epochs}\n"
+        f"last_epoch: {last_epoch}/{num_epochs}  windows: {last_n_windows}  epoch_sec: {last_epoch_sec:.1f}\n"
         f"train_sec_total: {train_sec_total:.1f}\n"
         f"mean_loss (objective): {last_mean_loss:.4f}\n"
         f"train_CE: {last_train_ce:.4f}  val_CE: {val_s}\n"
@@ -1363,6 +1364,23 @@ def _format_phase0_baseline_block(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Attractor dynamics language model (see README)."
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=NUM_EPOCHS,
+        help=f"Number of training epochs (default: {NUM_EPOCHS}).",
+    )
+    parser.add_argument(
+        "--state-dim",
+        type=int,
+        default=512,
+        help="Hidden state dimension D for embeddings and dynamics (default: 512).",
+    )
+    parser.add_argument(
+        "--print-vocab",
+        action="store_true",
+        help="Print FULL_VOCAB one word per line and exit (for corpus prep allowlists).",
     )
     parser.add_argument(
         "--corpus",
@@ -1462,6 +1480,14 @@ def main() -> None:
         help="Trajectory mode: print a hint for batches with loss above this (0 = off).",
     )
     args = parser.parse_args()
+    if args.print_vocab:
+        print("\n".join(FULL_VOCAB), flush=True)
+        return
+    if args.epochs < 1:
+        raise SystemExit("--epochs must be >= 1")
+    if args.state_dim < 8:
+        raise SystemExit("--state-dim must be >= 8")
+    num_epochs = args.epochs
     corpus_path = args.corpus if args.corpus is not None else DEFAULT_CORPUS_PATH
     random.seed(args.seed)
     window_size = args.window_size
@@ -1473,6 +1499,7 @@ def main() -> None:
     print(f"Vocab size: {len(FULL_VOCAB)}", flush=True)
     model = TorchAttractorLanguageModel(
         FULL_VOCAB,
+        state_dim=args.state_dim,
         train_window_size=window_size,
         max_window_steps=args.num_dynamics_steps,
     )
@@ -1525,12 +1552,12 @@ def main() -> None:
         )
 
     print(
-        f"Pre-training ({NUM_EPOCHS} epochs, sliding window size={window_size}, "
+        f"Pre-training ({num_epochs} epochs, sliding window size={window_size}, "
         f"num_dynamics_steps={args.num_dynamics_steps}, "
         f"epoch_copies={args.epoch_copies}, "
         f"loss_mode={args.loss_mode}, token_aux_ce={args.token_aux_ce}, "
-        f"trajectory_batch_size={args.trajectory_batch_size}, lr={args.lr}, "
-        f"lr_decay_every={args.lr_decay_every})...",
+        f"trajectory_batch_size={args.trajectory_batch_size}, state_dim={args.state_dim}, "
+        f"lr={args.lr}, lr_decay_every={args.lr_decay_every})...",
         flush=True,
     )
     if args.loss_mode == "trajectory" and args.token_aux_ce <= 0:
@@ -1550,7 +1577,7 @@ def main() -> None:
     last_epoch_sec = 0.0
     last_epoch_num = 0
     w2i = model._word_to_idx
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(num_epochs):
         training_sentences = list(train_sents * args.epoch_copies)
         random.shuffle(training_sentences)
         dataset = []
@@ -1564,7 +1591,7 @@ def main() -> None:
 
         n = len(dataset)
         t_ep0 = time.perf_counter()
-        print(f"  epoch {epoch + 1}/{NUM_EPOCHS}  |  {n} windows", flush=True)
+        print(f"  epoch {epoch + 1}/{num_epochs}  |  {n} windows", flush=True)
         loss_sum = 0.0
         mean_final_step_tension = float("nan")
         max_batch_loss_epoch = float("nan")
@@ -1779,6 +1806,7 @@ def main() -> None:
         epoch_copies=args.epoch_copies,
         window_size=window_size,
         num_dynamics_steps=args.num_dynamics_steps,
+        num_epochs=num_epochs,
         loss_mode=args.loss_mode,
         token_aux_ce=args.token_aux_ce,
         last_epoch=last_epoch_num,
