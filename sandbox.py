@@ -1,4 +1,5 @@
 import math
+from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -121,53 +122,172 @@ print(f"Vocab size: {len(FULL_VOCAB)}")
 
 # ==================== FIXED TORCH MODEL (shape bugs corrected) ====================
 class TorchAttractorLanguageModel(nn.Module):
-    def __init__(self, vocab, state_dim=512):
+    def __init__(
+        self,
+        vocab,
+        state_dim=512,
+        convergence_steps=4,
+        alpha=0.97,
+        w_fast=1.0,
+        w_slow=0.5,
+        gamma_init=0.2,
+    ):
         super().__init__()
         self.vocab = vocab
         self.vocab_size = len(vocab)
         self.state_dim = state_dim
+        # Partial updates per token (path-dependent evolution; not full relaxation).
+        self.convergence_steps = convergence_steps
+        # Slow memory blend: slow = alpha * slow + (1 - alpha) * fast
+        self.register_buffer("alpha", torch.tensor(float(alpha)))
+        # Decode / context mix: avoid slow memory overpowering fast transients.
+        self.register_buffer("w_fast", torch.tensor(float(w_fast)))
+        self.register_buffer("w_slow", torch.tensor(float(w_slow)))
+        # Context-dependent signal injection strength (trajectory sensitivity).
+        self.gamma = nn.Parameter(torch.tensor(float(gamma_init)))
+        self.register_buffer("signal_eps", torch.tensor(1e-6))
         self.dynamics = SimpleAttractorDynamics(state_dim)
         self.embedder = nn.Embedding(self.vocab_size, state_dim)
         self.norm = nn.LayerNorm(state_dim, elementwise_affine=False)
         # Unconstrained raw; effective temperature = softplus(raw) > 0 (learnable temp can hit 0 otherwise -> inf logits).
         t0 = 0.12
         self.temperature_raw = nn.Parameter(torch.tensor(math.log(math.exp(t0) - 1.0)))
+        # Debug: attractor keys and last-step metrics (set by evolve_token when track_attractors=True).
+        self.track_attractors = False
+        self._attractor_counts: Counter = Counter()
+        self._last_state_norm = 0.0
+        self._last_state_delta = 0.0
+        self._last_combined_norm = 0.0
 
     def effective_temperature(self) -> torch.Tensor:
         return F.softplus(self.temperature_raw).clamp(min=1e-6)
 
-    def get_signal(self, token_id: int) -> torch.Tensor:
-        emb = self.embedder(torch.tensor([token_id]))
+    def get_signal(self, token_id: int, fast_state=None, slow_state=None) -> torch.Tensor:
+        """Context-sensitive input: base embedding + gamma * normalized context; then unit-scale signal."""
+        device = self.embedder.weight.device
+        dtype = self.embedder.weight.dtype
+        if fast_state is not None:
+            device = fast_state.device
+            dtype = fast_state.dtype
+        emb = self.embedder(torch.tensor([token_id], device=device, dtype=torch.long))
         emb = self.norm(emb)
-        n = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
-        return (emb / n).squeeze(0)
+        n0 = torch.linalg.vector_norm(emb, dim=-1, keepdim=True).clamp(min=1e-12)
+        base_signal = (emb / n0).squeeze(0)
 
-    def converge(self, state, signal, num_steps=30):
-        s = state.clone() if state is not None else torch.zeros(self.state_dim)
-        for _ in range(num_steps):
-            s = self.dynamics(s, signal)
-        return s
+        fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
+        combined = self.w_fast * fast_state + self.w_slow * slow_state
+        fast_norm = torch.linalg.vector_norm(fast_state)
+        eps = self.signal_eps
+        if float(fast_norm.detach()) > 1e-8:
+            context_vector = fast_state / (fast_norm + eps)
+        else:
+            cn = torch.linalg.vector_norm(combined)
+            if float(cn.detach()) > 1e-8:
+                context_vector = combined / (cn + eps)
+            else:
+                context_vector = torch.zeros(self.state_dim, device=device, dtype=dtype)
 
-    def next_token_logits(self, state):
-        all_signals = torch.stack([self.get_signal(i) for i in range(self.vocab_size)])
+        signal = base_signal + self.gamma * context_vector
+        sn = torch.linalg.vector_norm(signal)
+        signal = signal / (sn + eps)
+        return signal
+
+    def _init_dual_state(self, fast_state, slow_state):
+        if fast_state is None:
+            fast_state = torch.zeros(self.state_dim, device=self.embedder.weight.device, dtype=self.embedder.weight.dtype)
+        if slow_state is None:
+            slow_state = torch.zeros(self.state_dim, device=self.embedder.weight.device, dtype=self.embedder.weight.dtype)
+        return fast_state, slow_state
+
+    def evolve_token(self, fast_state, slow_state, signal, num_steps=None):
+        """Apply a few dynamics steps on fast_state, then blend slow memory; decode uses fast + slow."""
+        fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
+        n = num_steps if num_steps is not None else self.convergence_steps
+        for _ in range(n):
+            prev_fast = fast_state.detach().clone()
+            fast_state = self.dynamics(fast_state, signal)
+            self._last_state_norm = float(torch.linalg.vector_norm(fast_state))
+            self._last_state_delta = float(torch.linalg.vector_norm(fast_state - prev_fast))
+            if self.track_attractors:
+                print(
+                    f"  [dyn] ||fast||={self._last_state_norm:.4f}  "
+                    f"||Δfast||={self._last_state_delta:.4f}"
+                )
+        slow_state = self.alpha * slow_state + (1.0 - self.alpha) * fast_state
+        combined = self.w_fast * fast_state + self.w_slow * slow_state
+        self._last_combined_norm = float(torch.linalg.vector_norm(combined))
+        if self.track_attractors:
+            aid = torch.round(combined, decimals=2)
+            key = aid.detach().cpu().numpy().tobytes()
+            self._attractor_counts[key] += 1
+            print(
+                f"  [token] ||combined||={self._last_combined_norm:.4f}  "
+                f"attractor_id[:4]={aid[:4].tolist()}"
+            )
+        return fast_state, slow_state
+
+    def step_token(self, fast_state, slow_state, signal):
+        """Single dynamics update per token (num_steps=1); use for maximal path dependence."""
+        return self.evolve_token(fast_state, slow_state, signal, num_steps=1)
+
+    def combined_state(self, fast_state, slow_state):
+        fast_state, slow_state = self._init_dual_state(fast_state, slow_state)
+        return self.w_fast * fast_state + self.w_slow * slow_state
+
+    def next_token_logits(self, fast_state, slow_state):
+        state = self.combined_state(fast_state, slow_state)
+        all_signals = torch.stack(
+            [self.get_signal(i, fast_state, slow_state) for i in range(self.vocab_size)]
+        )
         dists = torch.cdist(state.unsqueeze(0), all_signals).squeeze(0)
         logits = -dists / self.effective_temperature()
         logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=-1e4)
         return logits
 
-    def generate(self, prompt: str, max_tokens=40):
+    def encode_prompt(self, prompt: str):
+        """Run dynamics on prompt tokens only; return (fast_state, slow_state)."""
+        tokens = [w for w in prompt.lower().split() if w in self.vocab] or ["the"]
+        input_ids = [self.vocab.index(w) for w in tokens]
+        fast_state, slow_state = None, None
+        for tid in input_ids:
+            sig = self.get_signal(tid, fast_state, slow_state)
+            fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
+        return fast_state, slow_state
+
+    def _print_attractor_diversity(self, top_k: int = 5):
+        ctr = self._attractor_counts
+        total = sum(ctr.values())
+        n_unique = len(ctr)
+        if total == 0:
+            print("[diversity] no attractor samples")
+            return
+        probs = [c / total for _, c in ctr.most_common()]
+        entropy = -sum(p * math.log(p + 1e-30) for p in probs if p > 0)
+        top = ctr.most_common(top_k)
+        most_common_count = top[0][1] if top else 0
+        print(
+            f"[diversity] unique={n_unique}  total_tokens={total}  "
+            f"most_common_count={most_common_count}  entropy={entropy:.4f}"
+        )
+        print(f"[diversity] top-{top_k} raw counts: {[c for _, c in top]}")
+
+    def generate(self, prompt: str, max_tokens=40, debug_track=False):
         tokens = [w for w in prompt.lower().split() if w in self.vocab] or ["the"]
         input_ids = [self.vocab.index(w) for w in tokens]
 
-        state = None
+        self.track_attractors = debug_track
+        if debug_track:
+            self._attractor_counts = Counter()
+
+        fast_state, slow_state = None, None
         with torch.no_grad():
             for tid in input_ids:
-                sig = self.get_signal(tid)
-                state = self.converge(state, sig)
+                sig = self.get_signal(tid, fast_state, slow_state)
+                fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
 
             generated = tokens[:]
             for _ in range(max_tokens):
-                logits = self.next_token_logits(state)
+                logits = self.next_token_logits(fast_state, slow_state)
                 logits = logits - logits.max()
                 probs = F.softmax(logits, dim=-1)
                 if not torch.isfinite(probs).all() or float(probs.sum()) <= 0:
@@ -175,21 +295,39 @@ class TorchAttractorLanguageModel(nn.Module):
                 next_id = torch.multinomial(probs, 1).item()
                 next_word = self.vocab[next_id]
                 generated.append(next_word)
-                sig = self.get_signal(next_id)
-                state = self.converge(state, sig)
+                sig = self.get_signal(next_id, fast_state, slow_state)
+                fast_state, slow_state = self.evolve_token(fast_state, slow_state, sig)
+
+        if debug_track:
+            print(
+                f"[attractors] last||combined||={self._last_combined_norm:.4f}"
+            )
+            self._print_attractor_diversity(top_k=5)
+            self.track_attractors = False
+
         return " ".join(generated)
 
 
 class SimpleAttractorDynamics(nn.Module):
-    def __init__(self, dim=512, dt=0.04, cubic_scale=0.008):
+    def __init__(self, dim=512, dt=0.04, cubic_scale=0.008, beta_init=0.75, noise_scale=1e-3):
         super().__init__()
         self.dim = dim
         self.dt = dt
         self.cubic_scale = cubic_scale
         self.diffusion = nn.Parameter(make_diffusion_matrix(dim))
+        self.beta = nn.Parameter(torch.tensor(float(beta_init)))
+        self.register_buffer("noise_scale", torch.tensor(float(noise_scale)))
 
     def forward(self, state, signal):
-        return step_state(state, self.diffusion, signal, self.dt, self.cubic_scale)
+        return step_state(
+            state,
+            self.diffusion,
+            signal,
+            self.dt,
+            self.cubic_scale,
+            beta=self.beta,
+            noise_scale=self.noise_scale,
+        )
 
 
 def make_diffusion_matrix(dim):
@@ -200,11 +338,29 @@ def make_diffusion_matrix(dim):
     return (q * eigenvalues) @ q.T
 
 
-def step_state(state, diffusion, applied_signal, dt, cubic_scale):
+def compare_prompts(model: "TorchAttractorLanguageModel", prompt1: str, prompt2: str):
+    """Encode two prompts and report distance between final weighted combined states (path dependence)."""
+    model.eval()
+    with torch.no_grad():
+        f1, s1 = model.encode_prompt(prompt1)
+        f2, s2 = model.encode_prompt(prompt2)
+    c1 = model.combined_state(f1, s1)
+    c2 = model.combined_state(f2, s2)
+    dist = torch.linalg.vector_norm(c1 - c2).item()
+    cos = F.cosine_similarity(c1.unsqueeze(0), c2.unsqueeze(0), dim=1).item()
+    print(
+        f"[compare_prompts] L2(combined)={dist:.6f}  cosine={cos:.6f}  "
+        f"||c1||={torch.linalg.vector_norm(c1).item():.4f}  ||c2||={torch.linalg.vector_norm(c2).item():.4f}"
+    )
+
+
+def step_state(state, diffusion, applied_signal, dt, cubic_scale, beta=1.0, noise_scale=0.0):
     c = state - state.mean()
     nonlinear = cubic_scale * (c ** 3)
-    drift = state @ diffusion.T + nonlinear + applied_signal
+    drift = state @ diffusion.T + nonlinear + beta * applied_signal
     s = state + dt * drift
+    if noise_scale and float(noise_scale) > 0:
+        s = s + noise_scale * torch.randn_like(s)
     return torch.clamp(torch.nan_to_num(s, nan=0.0, posinf=0.0, neginf=0.0), -80.0, 80.0)
 
 
@@ -225,12 +381,12 @@ for epoch in range(3):
         if len(words) < 3:
             continue
         ids = [model.vocab.index(w) for w in words]
-        state = None
+        fast_state, slow_state = None, None
         loss = 0.0
         for i in range(len(ids) - 1):
-            sig = model.get_signal(ids[i])
-            state = model.converge(state, sig)
-            logits = model.next_token_logits(state)
+            sig = model.get_signal(ids[i], fast_state, slow_state)
+            fast_state, slow_state = model.evolve_token(fast_state, slow_state, sig)
+            logits = model.next_token_logits(fast_state, slow_state)
             target = torch.tensor([ids[i + 1]])
             loss += F.cross_entropy(logits.unsqueeze(0), target)
         if loss > 0:
@@ -244,3 +400,18 @@ print("\nPrompt 1:")
 print(model.generate("the quick brown fox jumps over the lazy dog and then what happens in the system of mind and reason"))
 print("\nPrompt 2:")
 print(model.generate("mind reason cause effect system"))
+print("\n(Order sensitivity check — same words, different order:)")
+print(model.generate("effect cause reason mind system"))
+print("\nDebug attractor tracking (one prompt):")
+model.generate("the system stays stable because the reason is clear", max_tokens=12, debug_track=True)
+print("\nTrajectory sensitivity (compare_prompts):")
+compare_prompts(
+    model,
+    "mind reason cause effect system",
+    "effect cause reason mind system",
+)
+compare_prompts(
+    model,
+    "the quick brown fox jumps over the lazy dog",
+    "the lazy dog jumps over the quick brown fox",
+)
